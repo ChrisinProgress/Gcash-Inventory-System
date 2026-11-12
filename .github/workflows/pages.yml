@@ -23,6 +23,17 @@ jobs:
           persist-credentials: false
       - name: Configure Pages
         uses: actions/configure-pages@v5
+      - name: Check Firebase web app configuration
+        run: |
+          node --input-type=module -e '
+            import { firebaseConfig } from "./public/js/firebase-config.js";
+            const required = ["apiKey", "authDomain", "projectId", "appId"];
+            const missing = required.filter(key => !firebaseConfig[key]?.trim());
+            if (missing.length) {
+              console.error(`GitHub Pages deployment stopped. Add Firebase values for: ${missing.join(", ")} in public/js/firebase-config.js.`);
+              process.exit(1);
+            }
+          '
       - name: Upload the static app
         uses: actions/upload-pages-artifact@v4
         with:

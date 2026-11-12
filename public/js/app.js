@@ -61,6 +61,9 @@ function friendlyError(error) {
     'auth/too-many-requests': 'Too many attempts. Wait a few minutes and try again.',
     'auth/network-request-failed': 'Unable to reach Firebase. Check your connection and try again.',
     'auth/operation-not-allowed': 'Enable Email/Password sign-in in Firebase Authentication.',
+    'auth/unauthorized-domain': 'Add this site’s hostname to Firebase Authentication → Settings → Authorized domains, then try again.',
+    'auth/invalid-api-key': 'The Firebase web API key is invalid. Check the web app configuration and API key restrictions.',
+    'auth/api-key-not-valid.-please-pass-a-valid-api-key.': 'The Firebase web API key is invalid or restricted. Check the web app configuration and API key restrictions.',
     'permission-denied': 'Firestore denied access. Check that the supplied security rules are deployed to this project.',
     unavailable: 'Unable to reach Firestore. Check your connection and try again.',
   };

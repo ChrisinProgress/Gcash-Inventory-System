@@ -1,0 +1,306 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function owner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    function accountPath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function transactionPath(uid, id) {
+      return /databases/$(database)/documents/users/$(uid)/transactions/$(id);
+    }
+
+    function adjustmentPath(uid, id) {
+      return /databases/$(database)/documents/users/$(uid)/adjustments/$(id);
+    }
+
+    function auditPath(uid, id) {
+      return /databases/$(database)/documents/users/$(uid)/audit/$(id);
+    }
+
+    function referencePath(uid, key) {
+      return /databases/$(database)/documents/users/$(uid)/references/$(key);
+    }
+
+    function validId(id) {
+      return id is string && id.matches('[a-zA-Z0-9_-]{16,80}');
+    }
+
+    function validBalance(amount) {
+      return amount is int && amount >= -999999999999 && amount <= 999999999999;
+    }
+
+    function validReason(reason) {
+      return reason is string && reason.size() <= 500;
+    }
+
+    function matchesCalendarDate(value) {
+      let year = int(value[0:4]);
+      let month = int(value[5:7]);
+      let day = int(value[8:10]);
+      let date = timestamp.date(year, month, day);
+      return year >= 1900 && year <= 9998 && date.year() == year && date.month() == month && date.day() == day;
+    }
+
+    function validTransactionDate(value) {
+      return value is string && value.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}') && matchesCalendarDate(value);
+    }
+
+    function feeTier(tier, max) {
+      let fee = tier.fee;
+      return tier.max == max && fee is int && fee >= 0 && fee <= 1100000;
+    }
+
+    function validFeeTiers(tiers) {
+      return tiers is list && tiers.size() == 22 &&
+        feeTier(tiers[0], 10000) && feeTier(tiers[1], 50000) &&
+        feeTier(tiers[2], 100000) && feeTier(tiers[3], 150000) &&
+        feeTier(tiers[4], 200000) && feeTier(tiers[5], 250000) &&
+        feeTier(tiers[6], 300000) && feeTier(tiers[7], 350000) &&
+        feeTier(tiers[8], 400000) && feeTier(tiers[9], 450000) &&
+        feeTier(tiers[10], 500000) && feeTier(tiers[11], 550000) &&
+        feeTier(tiers[12], 600000) && feeTier(tiers[13], 650000) &&
+        feeTier(tiers[14], 700000) && feeTier(tiers[15], 750000) &&
+        feeTier(tiers[16], 800000) && feeTier(tiers[17], 850000) &&
+        feeTier(tiers[18], 900000) && feeTier(tiers[19], 950000) &&
+        feeTier(tiers[20], 1000000) && feeTier(tiers[21], 1100000);
+    }
+
+    function validSettings(settings) {
+      return settings is map && settings.keys().hasOnly(['feeTiers', 'cashOutFeeMode']) &&
+        settings.cashOutFeeMode in ['deduct', 'separate'] && validFeeTiers(settings.feeTiers);
+    }
+
+    function validAccount(data) {
+      return data.keys().hasOnly([
+        'cash', 'wallet', 'openingCash', 'openingWallet', 'settings', 'lastOperation', 'updatedAt'
+      ]) && validBalance(data.cash) && validBalance(data.wallet) &&
+        validBalance(data.openingCash) && data.openingCash >= 0 &&
+        validBalance(data.openingWallet) && data.openingWallet >= 0 &&
+        data.updatedAt == request.time;
+    }
+
+    function validOperation(op) {
+      return op is map && op.keys().hasOnly(['kind', 'id', 'requestId']) &&
+        op.kind in ['record', 'correct', 'void', 'manual', 'opening', 'settings'] &&
+        validId(op.id) && validId(op.requestId);
+    }
+
+    function activeOperation(uid, kind, id) {
+      // The companion write must update the account in this same commit.
+      let data = getAfter(accountPath(uid)).data;
+      return data.updatedAt == request.time && data.lastOperation.kind == kind &&
+        data.lastOperation.id == id;
+    }
+
+    function balancesMatch(prev, next, cashDelta, walletDelta) {
+      return next.cash == prev.cash + cashDelta && next.wallet == prev.wallet + walletDelta;
+    }
+
+    function fundsAvailable(prev, next) {
+      return (next.cash >= 0 || next.cash >= prev.cash) &&
+        (next.wallet >= 0 || next.wallet >= prev.wallet);
+    }
+
+    function accountRecord(uid, op, prev, next) {
+      let tx = getAfter(transactionPath(uid, op.id)).data;
+      return op.id == op.requestId && tx.updatedAt == request.time && tx.createdAt == request.time &&
+        tx.status == 'completed' && balancesMatch(prev, next, tx.cashDelta, tx.walletDelta) &&
+        fundsAvailable(prev, next);
+    }
+
+    function accountRevision(uid, op, prev, next) {
+      let previousTx = get(transactionPath(uid, op.id)).data;
+      let nextTx = getAfter(transactionPath(uid, op.id)).data;
+      return previousTx.status == 'completed' && nextTx.updatedAt == request.time &&
+        (op.kind == 'void'
+          ? nextTx.status == 'voided' && balancesMatch(prev, next, -previousTx.cashDelta, -previousTx.walletDelta)
+          : nextTx.status == 'completed' && fundsAvailable(prev, next) &&
+            balancesMatch(prev, next, nextTx.cashDelta - previousTx.cashDelta, nextTx.walletDelta - previousTx.walletDelta));
+    }
+
+    function accountAdjustment(uid, op, prev, next) {
+      let adj = getAfter(adjustmentPath(uid, op.id)).data;
+      return op.id == op.requestId && adj.createdAt == request.time &&
+        adj.kind == op.kind && adj.beforeCash == prev.cash && adj.beforeWallet == prev.wallet &&
+        adj.afterCash == next.cash && adj.afterWallet == next.wallet &&
+        balancesMatch(prev, next, adj.cashDelta, adj.walletDelta) && fundsAvailable(prev, next) &&
+        (op.kind != 'opening' ||
+          (next.openingCash - prev.openingCash == adj.cashDelta && next.openingWallet - prev.openingWallet == adj.walletDelta));
+    }
+
+    function validAccountUpdate(uid, prev, next) {
+      let op = next.lastOperation;
+      let changed = next.diff(prev).affectedKeys();
+      return validAccount(next) && validOperation(op) && (
+        (op.kind == 'settings' && op.id == op.requestId &&
+          changed.hasOnly(['settings', 'lastOperation', 'updatedAt']) && validSettings(next.settings)) ||
+        (op.kind == 'record' && changed.hasOnly(['cash', 'wallet', 'lastOperation', 'updatedAt']) &&
+          accountRecord(uid, op, prev, next)) ||
+        (op.kind in ['correct', 'void'] && changed.hasOnly(['cash', 'wallet', 'lastOperation', 'updatedAt']) &&
+          accountRevision(uid, op, prev, next)) ||
+        (op.kind == 'manual' && changed.hasOnly(['cash', 'wallet', 'lastOperation', 'updatedAt']) &&
+          accountAdjustment(uid, op, prev, next)) ||
+        (op.kind == 'opening' &&
+          changed.hasOnly(['cash', 'wallet', 'openingCash', 'openingWallet', 'lastOperation', 'updatedAt']) &&
+          accountAdjustment(uid, op, prev, next))
+      );
+    }
+
+    function matchingTier(data, settings) {
+      let index = data.feeTierIndex;
+      return index is int && index >= 0 && index < settings.feeTiers.size() &&
+        data.amount <= settings.feeTiers[index].max &&
+        (index == 0 || data.amount > settings.feeTiers[index - 1].max) &&
+        data.fee is int && data.fee == settings.feeTiers[index].fee &&
+        data.feeMode == settings.cashOutFeeMode;
+    }
+
+    function matchingReceipt(data) {
+      return data.amountReceived == data.received &&
+        (data.received == null
+          ? data.change == null
+          : (data.type == 'cash-in' || data.feeMode == 'separate') &&
+            data.received is int && data.received >= data.payment && data.received <= 9007199254740991 &&
+            data.change is int && data.change == data.received - data.payment);
+    }
+
+    function matchingTransactionAmounts(data) {
+      return data.payment is int && data.payout is int && data.payout >= 0 &&
+        data.total is int && data.profit is int && data.profit == data.fee &&
+        data.cashDelta is int && data.cashDelta == data.payment - data.payout &&
+        data.walletDelta is int && (
+          (data.type == 'cash-in' && data.payment == data.amount + data.fee && data.payout == 0 &&
+            data.total == data.payment && data.walletDelta == -data.amount) ||
+          (data.type == 'cash-out' && data.total == data.payout && data.walletDelta == data.amount &&
+            (data.feeMode == 'deduct'
+              ? data.payment == 0 && data.payout == data.amount - data.fee
+              : data.payment == data.fee && data.payout == data.amount))
+        ) && matchingReceipt(data);
+    }
+
+    function validTransaction(uid, id, data) {
+      let settings = get(accountPath(uid)).data.settings;
+      return data.keys().hasOnly([
+        'id', 'ownerId', 'type', 'amount', 'fee', 'feeTierIndex', 'feeMode', 'total', 'payment', 'payout',
+        'received', 'amountReceived', 'change', 'cashDelta', 'walletDelta', 'profit', 'customer',
+        'reference', 'referenceKey', 'notes', 'status', 'occurredOn', 'createdAt', 'updatedAt'
+      ]) && validId(id) && data.id == id && data.ownerId == uid && data.status == 'completed' &&
+        validTransactionDate(data.occurredOn) && data.createdAt is timestamp && data.updatedAt == request.time &&
+        data.customer is string && data.customer.matches('09[0-9]{9}') &&
+        data.notes is string && data.notes.size() <= 1000 &&
+        data.reference is string && data.referenceKey is string &&
+        (data.reference == '' ? data.referenceKey == '' :
+          data.reference.matches('[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}') &&
+          data.referenceKey == 'ref-' + data.reference.lower()) &&
+        data.amount is int && data.amount >= 100 && data.amount <= 1100000 &&
+        matchingTier(data, settings) && matchingTransactionAmounts(data);
+    }
+
+    function referenceAssigned(uid, id, data) {
+      return data.referenceKey == '' || getAfter(referencePath(uid, data.referenceKey)).data.transactionId == id;
+    }
+
+    function referenceReleased(uid, prev, next) {
+      return prev.referenceKey == '' ||
+        (next.status == 'completed' && prev.referenceKey == next.referenceKey) ||
+        !existsAfter(referencePath(uid, prev.referenceKey));
+    }
+
+    function matchingAudit(uid, id, action, prev) {
+      // Revisions require an immutable copy of the record being replaced.
+      let requestId = getAfter(accountPath(uid)).data.lastOperation.requestId;
+      let entry = getAfter(auditPath(uid, requestId)).data;
+      return entry.at == request.time && entry.transactionId == id &&
+        entry.action == action && entry.before == prev;
+    }
+
+    match /users/{uid} {
+      allow get: if owner(uid);
+      allow create: if owner(uid) && validAccount(request.resource.data) &&
+        request.resource.data.cash == 0 && request.resource.data.wallet == 0 &&
+        request.resource.data.openingCash == 0 && request.resource.data.openingWallet == 0 &&
+        request.resource.data.lastOperation == null && validSettings(request.resource.data.settings);
+      allow update: if owner(uid) && validAccountUpdate(uid, resource.data, request.resource.data);
+
+      match /transactions/{id} {
+        allow read: if owner(uid);
+        allow create: if owner(uid) && activeOperation(uid, 'record', id) &&
+          validTransaction(uid, id, request.resource.data) &&
+          request.resource.data.createdAt == request.time &&
+          referenceAssigned(uid, id, request.resource.data);
+        allow update: if owner(uid) && resource.data.status == 'completed' &&
+          request.resource.data.updatedAt == request.time &&
+          referenceReleased(uid, resource.data, request.resource.data) && (
+            (activeOperation(uid, 'correct', id) &&
+              request.resource.data.createdAt == resource.data.createdAt &&
+              validTransaction(uid, id, request.resource.data) &&
+              referenceAssigned(uid, id, request.resource.data) && matchingAudit(uid, id, 'corrected', resource.data)) ||
+            (activeOperation(uid, 'void', id) && request.resource.data.status == 'voided' &&
+              request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt']) &&
+              matchingAudit(uid, id, 'voided', resource.data))
+          );
+      }
+
+      match /adjustments/{id} {
+        allow read: if owner(uid);
+        allow create: if owner(uid) && validAdjustment(uid, id, request.resource.data);
+      }
+
+      match /audit/{id} {
+        allow read: if owner(uid);
+        allow create: if owner(uid) && validAudit(uid, id, request.resource.data);
+      }
+
+      match /references/{key} {
+        allow get: if owner(uid);
+        allow create: if owner(uid) && validReference(uid, key, request.resource.data);
+        allow delete: if owner(uid) && removableReference(uid, key, resource.data);
+      }
+    }
+
+    function validAdjustment(uid, id, data) {
+      return data.keys().hasOnly([
+        'id', 'ownerId', 'kind', 'account', 'cashDelta', 'walletDelta', 'beforeCash', 'beforeWallet',
+        'afterCash', 'afterWallet', 'reason', 'createdAt'
+      ]) && validId(id) && data.id == id && data.ownerId == uid &&
+        data.createdAt == request.time && validReason(data.reason) &&
+        data.cashDelta is int && data.walletDelta is int &&
+        validBalance(data.beforeCash) && validBalance(data.beforeWallet) &&
+        validBalance(data.afterCash) && validBalance(data.afterWallet) &&
+        activeOperation(uid, data.kind, id) && (
+          (data.kind == 'opening' && data.account == 'both') ||
+          (data.kind == 'manual' && (
+            (data.account == 'cash' && data.cashDelta != 0 && data.walletDelta == 0) ||
+            (data.account == 'wallet' && data.cashDelta == 0 && data.walletDelta != 0)
+          ))
+        );
+    }
+
+    function validAudit(uid, id, data) {
+      let op = getAfter(accountPath(uid)).data.lastOperation;
+      let kind = data.action == 'corrected' ? 'correct' : 'void';
+      return data.keys().hasOnly(['transactionId', 'action', 'at', 'reason', 'before']) &&
+        validId(id) && validId(data.transactionId) &&
+        data.action in ['corrected', 'voided'] && data.at == request.time && validReason(data.reason) &&
+        op.requestId == id && activeOperation(uid, kind, data.transactionId) &&
+        data.before == get(transactionPath(uid, data.transactionId)).data &&
+        getAfter(transactionPath(uid, data.transactionId)).data.updatedAt == request.time;
+    }
+
+    function validReference(uid, key, data) {
+      let tx = getAfter(transactionPath(uid, data.transactionId)).data;
+      return data.keys().hasOnly(['transactionId', 'createdAt']) &&
+        validId(data.transactionId) && data.createdAt == request.time &&
+        tx.status == 'completed' && tx.referenceKey == key && tx.updatedAt == request.time;
+    }
+
+    function removableReference(uid, key, data) {
+      let tx = getAfter(transactionPath(uid, data.transactionId)).data;
+      return tx.updatedAt == request.time && (tx.status == 'voided' || tx.referenceKey != key);
+    }
+  }
+}

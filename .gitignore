@@ -1,0 +1,4 @@
+.firebase/
+.firebaserc
+*-debug.log
+emulator-data/
